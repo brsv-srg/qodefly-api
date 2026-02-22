@@ -24,6 +24,7 @@ app.add_middleware(
 # Database setup
 DATABASE = "waitlist.db"
 
+
 @contextmanager
 def get_db():
     conn = sqlite3.connect(DATABASE)
