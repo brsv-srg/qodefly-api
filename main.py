@@ -10,7 +10,12 @@ app = FastAPI(title="Qodefly Waitlist API", version="1.0.0")
 # CORS для frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://qodefly.io", "http://qodefly.io", "http://localhost:3000"],
+    allow_origins=[
+        "https://qodefly.io",
+        "http://qodefly.io",
+        "https://api.qodefly.io",
+        "http://localhost:3000"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
