@@ -27,7 +27,7 @@ JWT_EXPIRATION_HOURS = 72
 limiter = Limiter(key_func=get_remote_address)
 
 # --- App ---
-app = FastAPI(title="Qodefly API", version="2.0.0")
+app = FastAPI(title="Qodefly API", version="3.0.0")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -79,6 +79,21 @@ def init_db():
                 last_login TIMESTAMP,
                 is_active INTEGER DEFAULT 1,
                 is_beta INTEGER DEFAULT 1
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS projects (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                slug TEXT NOT NULL,
+                description TEXT,
+                html_code TEXT,
+                status TEXT DEFAULT 'draft',
+                version INTEGER DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id)
             )
         """)
         conn.commit()
@@ -202,19 +217,47 @@ class AuthResponse(BaseModel):
     user: dict
 
 
+class GenerateRequest(BaseModel):
+    prompt: str
+    project_id: int | None = None  # if iterating on existing project
+    design_preferences: str | None = None
+
+    @field_validator("prompt")
+    @classmethod
+    def prompt_not_empty(cls, v):
+        if len(v.strip()) < 5:
+            raise ValueError("Prompt must be at least 5 characters")
+        return v.strip()
+
+
+class SaveProjectRequest(BaseModel):
+    name: str
+    description: str
+    html_code: str
+
+
+class UpdateProjectRequest(BaseModel):
+    prompt: str
+
+
 # ==================== PUBLIC ROUTES ====================
 
 @app.get("/")
 async def root():
     return {
         "message": "Qodefly API",
-        "version": "2.0.0",
+        "version": "3.0.0",
         "endpoints": {
             "POST /auth/register": "Create account (beta)",
             "POST /auth/login": "Log in",
             "GET /auth/me": "Get current user",
+            "POST /projects/generate": "Generate HTML from prompt (AI)",
+            "POST /projects": "Save a project",
+            "GET /projects": "List user projects",
+            "GET /projects/{id}": "Get project details",
+            "PUT /projects/{id}": "Iterate on project with new prompt",
+            "DELETE /projects/{id}": "Delete project",
             "POST /waitlist": "Submit email to waitlist",
-            "GET /waitlist/count": "Get total waitlist count",
             "GET /health": "Health check",
         },
     }
@@ -299,6 +342,230 @@ async def get_me(user=Depends(get_current_user)):
         "created_at": row["created_at"],
         "is_beta": bool(row["is_beta"]),
     }
+
+
+# ==================== AI GENERATION (STUB) ====================
+
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+
+
+def generate_with_ai(prompt: str, existing_code: str | None = None, design_prefs: str | None = None) -> dict:
+    """
+    Generate HTML from prompt using Claude API.
+    Currently returns a stub. Replace with real Claude API call later.
+    """
+    from prompts import build_system_prompt, build_user_message
+
+    system_prompt = build_system_prompt(design_prefs)
+    user_message = build_user_message(prompt, existing_code)
+
+    if ANTHROPIC_API_KEY:
+        try:
+            import httpx
+            response = httpx.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": "claude-sonnet-4-20250514",
+                    "max_tokens": 16000,
+                    "system": system_prompt,
+                    "messages": [{"role": "user", "content": user_message}],
+                },
+                timeout=120.0,
+            )
+            response.raise_for_status()
+            data = response.json()
+            html = data["content"][0]["text"]
+
+            # Clean up if Claude wrapped in code fences
+            if html.startswith("```"):
+                html = html.split("\n", 1)[1]
+            if html.endswith("```"):
+                html = html.rsplit("```", 1)[0]
+            html = html.strip()
+
+            return {
+                "html": html,
+                "name": prompt[:50].strip(),
+                "description": prompt,
+            }
+        except Exception as e:
+            # Fall through to stub if API fails
+            print(f"Claude API error: {e}")
+
+    # STUB: generate a placeholder when no API key
+    stub_html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Generated by Qodefly</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
+    <style>body {{ font-family: 'Inter', sans-serif; }}</style>
+</head>
+<body class="min-h-screen bg-gradient-to-br from-slate-900 to-slate-800 text-white flex items-center justify-center p-8">
+    <div class="max-w-2xl text-center">
+        <div class="inline-block px-4 py-2 bg-indigo-500/10 border border-indigo-500/30 rounded-full text-sm text-indigo-400 mb-8">
+            Generated with Qodefly AI
+        </div>
+        <h1 class="text-5xl font-extrabold mb-6 bg-gradient-to-r from-indigo-400 to-purple-400 bg-clip-text text-transparent">
+            Your Project
+        </h1>
+        <p class="text-lg text-slate-400 mb-10 leading-relaxed">
+            This is a preview placeholder. Connect your Anthropic API key to generate real websites from your description.
+        </p>
+        <div class="bg-white/5 border border-white/10 rounded-2xl p-6 text-left">
+            <h3 class="text-xs uppercase text-slate-500 tracking-wider mb-2">Your prompt</h3>
+            <p class="text-slate-300">{prompt}</p>
+        </div>
+        {('<div class="mt-4 bg-white/5 border border-white/10 rounded-2xl p-6 text-left"><h3 class="text-xs uppercase text-slate-500 tracking-wider mb-2">Design preferences</h3><p class="text-slate-300">' + (design_prefs or '') + '</p></div>') if design_prefs else ''}
+    </div>
+</body>
+</html>"""
+
+    return {
+        "html": stub_html,
+        "name": prompt[:50].strip(),
+        "description": prompt,
+    }
+
+
+def slugify(text: str) -> str:
+    """Create a URL-safe slug from text"""
+    import re
+    slug = text.lower().strip()
+    slug = re.sub(r'[^\w\s-]', '', slug)
+    slug = re.sub(r'[\s_]+', '-', slug)
+    slug = re.sub(r'-+', '-', slug)
+    return slug[:60].strip('-')
+
+
+# ==================== PROJECT ROUTES ====================
+
+@app.post("/projects/generate")
+@limiter.limit("10/minute")
+async def generate_project(request: Request, body: GenerateRequest, user=Depends(get_current_user)):
+    """Generate HTML from a prompt using AI"""
+    existing_code = None
+
+    # If iterating on existing project, load current code
+    if body.project_id:
+        with get_db() as conn:
+            row = conn.execute(
+                "SELECT html_code FROM projects WHERE id = ? AND user_id = ?",
+                (body.project_id, user["user_id"]),
+            ).fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Project not found")
+            existing_code = row["html_code"]
+
+    result = generate_with_ai(body.prompt, existing_code, body.design_preferences)
+    return result
+
+
+@app.post("/projects")
+@limiter.limit("10/minute")
+async def create_project(request: Request, body: SaveProjectRequest, user=Depends(get_current_user)):
+    """Save a generated project"""
+    slug = slugify(body.name)
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO projects (user_id, name, slug, description, html_code) VALUES (?, ?, ?, ?, ?)",
+            (user["user_id"], body.name, slug, body.description, body.html_code),
+        )
+        conn.commit()
+        project_id = cursor.lastrowid
+
+    return {
+        "id": project_id,
+        "name": body.name,
+        "slug": slug,
+        "status": "draft",
+        "version": 1,
+    }
+
+
+@app.get("/projects")
+async def list_projects(user=Depends(get_current_user)):
+    """List all projects for the current user"""
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT id, name, slug, description, status, version, created_at, updated_at "
+            "FROM projects WHERE user_id = ? ORDER BY updated_at DESC",
+            (user["user_id"],),
+        ).fetchall()
+
+    return {
+        "total": len(rows),
+        "projects": [dict(row) for row in rows],
+    }
+
+
+@app.get("/projects/{project_id}")
+async def get_project(project_id: int, user=Depends(get_current_user)):
+    """Get a single project with its code"""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT id, name, slug, description, html_code, status, version, created_at, updated_at "
+            "FROM projects WHERE id = ? AND user_id = ?",
+            (project_id, user["user_id"]),
+        ).fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return dict(row)
+
+
+@app.put("/projects/{project_id}")
+@limiter.limit("10/minute")
+async def update_project(request: Request, project_id: int, body: UpdateProjectRequest, user=Depends(get_current_user)):
+    """Iterate on an existing project with a new prompt"""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT html_code, version FROM projects WHERE id = ? AND user_id = ?",
+            (project_id, user["user_id"]),
+        ).fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    result = generate_with_ai(body.prompt, row["html_code"], None)
+
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE projects SET html_code = ?, version = ?, updated_at = ? WHERE id = ? AND user_id = ?",
+            (result["html"], row["version"] + 1, datetime.now().isoformat(), project_id, user["user_id"]),
+        )
+        conn.commit()
+
+    return {
+        "id": project_id,
+        "version": row["version"] + 1,
+        "html": result["html"],
+    }
+
+
+@app.delete("/projects/{project_id}")
+async def delete_project(project_id: int, user=Depends(get_current_user)):
+    """Delete a project"""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT id FROM projects WHERE id = ? AND user_id = ?",
+            (project_id, user["user_id"]),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Project not found")
+        conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+        conn.commit()
+
+    return {"message": "Project deleted"}
 
 
 # ==================== WAITLIST ROUTES ====================
