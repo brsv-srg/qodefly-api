@@ -72,7 +72,117 @@ The user wants to modify this existing project. Apply the requested changes whil
 """
 
 
-def build_system_prompt(design_preferences: str | None = None) -> str:
+from typing import Optional
+
+
+CONTEXT_MD_TEMPLATE = """
+## PROJECT CONTEXT
+
+Important notes and history for this project. Follow any instructions here:
+
+{context_md}
+"""
+
+RESOURCES_TEMPLATE = """
+## PROJECT RESOURCES
+
+The following resources are available. Use them where appropriate:
+
+{resources}
+"""
+
+STRUCTURED_DESIGN_TEMPLATE = """
+## USER DESIGN PREFERENCES
+
+{rendered}
+"""
+
+
+def _render_design_prefs(prefs: Optional[dict]) -> str:
+    """Render JSONB design preferences into compact prompt text."""
+    if not prefs:
+        return ""
+    parts = []
+    if tags := prefs.get("style_tags"):
+        parts.append(f"Style: {', '.join(tags)}")
+    if colors := prefs.get("colors"):
+        color_parts = [f"{k}: {v}" for k, v in colors.items() if v]
+        if color_parts:
+            parts.append(f"Colors: {', '.join(color_parts)}")
+    if fonts := prefs.get("fonts"):
+        font_parts = [f"{k}: {v}" for k, v in fonts.items() if v]
+        if font_parts:
+            parts.append(f"Fonts: {', '.join(font_parts)}")
+    if spacing := prefs.get("spacing"):
+        parts.append(f"Spacing: {spacing}")
+    if notes := prefs.get("notes"):
+        parts.append(f"Notes: {notes}")
+    return "\n".join(parts)
+
+
+def _render_resources(resources: Optional[list]) -> str:
+    """Render resource list into compact prompt text."""
+    if not resources:
+        return ""
+    lines = []
+    for r in resources:
+        name = r.get("name", "unnamed")
+        rtype = r.get("resource_type", "text")
+        desc = r.get("description", "")
+        if rtype == "text" and r.get("content"):
+            lines.append(f"- {name}: {r['content'][:200]}")
+        elif desc:
+            lines.append(f"- {name} ({rtype}): {desc}")
+        else:
+            lines.append(f"- {name} ({rtype})")
+    return "\n".join(lines)
+
+
+def build_full_context(
+    prompt: str,
+    existing_code: Optional[str] = None,
+    design_prefs: Optional[dict] = None,
+    context_md: Optional[str] = None,
+    resources: Optional[list] = None,
+) -> tuple:
+    """Build system prompt + user message with full project context.
+
+    Returns (system_prompt, user_message). Keeps total context compact
+    by rendering each section only when non-empty.
+    """
+    # System prompt with design preferences
+    design_text = ""
+    if design_prefs and isinstance(design_prefs, dict):
+        rendered = _render_design_prefs(design_prefs)
+        if rendered:
+            design_text = STRUCTURED_DESIGN_TEMPLATE.format(rendered=rendered)
+    elif design_prefs and isinstance(design_prefs, str):
+        design_text = DESIGN_PREFERENCES_TEMPLATE.format(preferences=design_prefs)
+
+    system_prompt = QODEFLY_SYSTEM_PROMPT.format(design_preferences=design_text)
+
+    # Context sections for user message
+    context_parts = []
+
+    if context_md and context_md.strip():
+        trimmed = context_md.strip()[:2000]
+        context_parts.append(CONTEXT_MD_TEMPLATE.format(context_md=trimmed))
+
+    if resources:
+        rendered_res = _render_resources(resources)
+        if rendered_res:
+            context_parts.append(RESOURCES_TEMPLATE.format(resources=rendered_res))
+
+    if existing_code:
+        context_parts.append(ITERATION_CONTEXT_TEMPLATE.format(existing_code=existing_code))
+
+    context_parts.append(f"## USER REQUEST\n\n{prompt}")
+
+    user_message = "\n".join(context_parts)
+    return system_prompt, user_message
+
+
+def build_system_prompt(design_preferences: Optional[str] = None) -> str:
     """Build the full system prompt with optional design preferences."""
     prefs = ""
     if design_preferences:
@@ -80,7 +190,7 @@ def build_system_prompt(design_preferences: str | None = None) -> str:
     return QODEFLY_SYSTEM_PROMPT.format(design_preferences=prefs)
 
 
-def build_user_message(prompt: str, existing_code: str | None = None) -> str:
+def build_user_message(prompt: str, existing_code: Optional[str] = None) -> str:
     """Build the user message with optional existing code context."""
     if existing_code:
         context = ITERATION_CONTEXT_TEMPLATE.format(existing_code=existing_code)

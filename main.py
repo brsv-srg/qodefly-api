@@ -19,10 +19,13 @@ from slowapi.errors import RateLimitExceeded
 
 # --- Configuration ---
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://qodefly:qodefly@localhost:5432/qodefly")
+UPLOADS_DIR = os.environ.get("UPLOADS_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads"))
+os.makedirs(UPLOADS_DIR, exist_ok=True)
 ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "change-me-in-production")
 JWT_SECRET = os.environ.get("JWT_SECRET", "change-me-jwt-secret-in-production")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRATION_HOURS = 72
+MAX_UPLOAD_SIZE = 10 * 1024 * 1024  # 10 MB
 
 # --- Rate Limiter ---
 limiter = Limiter(key_func=get_remote_address)
@@ -155,11 +158,28 @@ def init_db():
             current_version = 1
             migrations_applied += 1
 
+        # Migration 2: project context, design preferences, resources
+        if current_version < 2:
+            _add_column_if_missing(cur, "projects", "design_preferences", "JSONB DEFAULT '{}'")
+            _add_column_if_missing(cur, "projects", "context_md", "TEXT DEFAULT ''")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS project_resources (
+                    id SERIAL PRIMARY KEY,
+                    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    user_id INTEGER NOT NULL REFERENCES users(id),
+                    resource_type TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    description TEXT,
+                    content TEXT,
+                    mime_type TEXT,
+                    file_size INTEGER,
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            current_version = 2
+            migrations_applied += 1
+
         # --- Future migrations go here ---
-        # if current_version < 2:
-        #     _add_column_if_missing(cur, "projects", "deployed_url", "TEXT")
-        #     current_version = 2
-        #     migrations_applied += 1
 
         cur.execute(
             "UPDATE schema_version SET version = %s, updated_at = %s WHERE id = 1",
@@ -301,14 +321,25 @@ class GenerateRequest(BaseModel):
         return v.strip()
 
 
-class SaveProjectRequest(BaseModel):
-    name: str
-    description: str
-    html_code: str
+class CreateProjectRequest(BaseModel):
+    name: str = "Untitled Project"
+    design_preferences: dict | None = None
 
 
 class UpdateProjectRequest(BaseModel):
-    prompt: str
+    prompt: str | None = None
+    name: str | None = None
+    description: str | None = None
+    design_preferences: dict | None = None
+    context_md: str | None = None
+    html_code: str | None = None
+
+
+class ResourceRequest(BaseModel):
+    resource_type: str
+    name: str
+    description: str = ""
+    content: str | None = None
 
 
 # ==================== PUBLIC ROUTES ====================
@@ -425,53 +456,58 @@ async def get_me(user=Depends(get_current_user)):
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 
+def _call_claude(system_prompt: str, user_message: str) -> str | None:
+    """Call Claude API and return raw text response, or None on failure."""
+    if not ANTHROPIC_API_KEY:
+        return None
+    try:
+        import httpx
+        response = httpx.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 16000,
+                "system": system_prompt,
+                "messages": [{"role": "user", "content": user_message}],
+            },
+            timeout=120.0,
+        )
+        response.raise_for_status()
+        data = response.json()
+        html = data["content"][0]["text"]
+        if html.startswith("```"):
+            html = html.split("\n", 1)[1]
+        if html.endswith("```"):
+            html = html.rsplit("```", 1)[0]
+        return html.strip()
+    except Exception as e:
+        print(f"Claude API error: {e}")
+        return None
+
+
+def generate_with_ai_full(system_prompt: str, user_message: str) -> dict:
+    """Generate HTML using pre-built system prompt and user message."""
+    html = _call_claude(system_prompt, user_message)
+    if html:
+        return {"html": html}
+    return {"html": "<p>AI generation failed. Please try again.</p>"}
+
+
 def generate_with_ai(prompt: str, existing_code: str | None = None, design_prefs: str | None = None) -> dict:
-    """
-    Generate HTML from prompt using Claude API.
-    Currently returns a stub. Replace with real Claude API call later.
-    """
+    """Generate HTML from prompt using Claude API (legacy — used by POST /projects/generate)."""
     from prompts import build_system_prompt, build_user_message
 
     system_prompt = build_system_prompt(design_prefs)
     user_message = build_user_message(prompt, existing_code)
 
-    if ANTHROPIC_API_KEY:
-        try:
-            import httpx
-            response = httpx.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": ANTHROPIC_API_KEY,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
-                json={
-                    "model": "claude-sonnet-4-20250514",
-                    "max_tokens": 16000,
-                    "system": system_prompt,
-                    "messages": [{"role": "user", "content": user_message}],
-                },
-                timeout=120.0,
-            )
-            response.raise_for_status()
-            data = response.json()
-            html = data["content"][0]["text"]
-
-            # Clean up if Claude wrapped in code fences
-            if html.startswith("```"):
-                html = html.split("\n", 1)[1]
-            if html.endswith("```"):
-                html = html.rsplit("```", 1)[0]
-            html = html.strip()
-
-            return {
-                "html": html,
-                "name": prompt[:50].strip(),
-                "description": prompt,
-            }
-        except Exception as e:
-            # Fall through to stub if API fails
-            print(f"Claude API error: {e}")
+    html = _call_claude(system_prompt, user_message)
+    if html:
+        return {"html": html, "name": prompt[:50].strip(), "description": prompt}
 
     # STUB: generate a placeholder when no API key
     stub_html = f"""<!DOCTYPE html>
@@ -548,26 +584,22 @@ async def generate_project(request: Request, body: GenerateRequest, user=Depends
 
 @app.post("/projects")
 @limiter.limit("10/minute")
-async def create_project(request: Request, body: SaveProjectRequest, user=Depends(get_current_user)):
-    """Save a generated project"""
+async def create_project(request: Request, body: CreateProjectRequest, user=Depends(get_current_user)):
+    """Create a new project (minimal — no HTML required)"""
+    import json as _json
     slug = slugify(body.name)
+    design_prefs = _json.dumps(body.design_preferences or {})
 
     with get_db() as conn:
         cur = conn.cursor()
         cur.execute(
-            "INSERT INTO projects (user_id, name, slug, description, html_code) VALUES (%s, %s, %s, %s, %s) RETURNING id",
-            (user["user_id"], body.name, slug, body.description, body.html_code),
+            "INSERT INTO projects (user_id, name, slug, design_preferences) VALUES (%s, %s, %s, %s::jsonb) RETURNING id, name, slug, status, version, created_at",
+            (user["user_id"], body.name, slug, design_prefs),
         )
-        project_id = cur.fetchone()["id"]
+        row = cur.fetchone()
         conn.commit()
 
-    return {
-        "id": project_id,
-        "name": body.name,
-        "slug": slug,
-        "status": "draft",
-        "version": 1,
-    }
+    return row
 
 
 @app.get("/projects")
@@ -594,7 +626,8 @@ async def get_project(project_id: int, user=Depends(get_current_user)):
     with get_db() as conn:
         cur = conn.cursor()
         cur.execute(
-            "SELECT id, name, slug, description, html_code, status, version, created_at, updated_at "
+            "SELECT id, name, slug, description, html_code, status, version, "
+            "design_preferences, context_md, created_at, updated_at "
             "FROM projects WHERE id = %s AND user_id = %s",
             (project_id, user["user_id"]),
         )
@@ -608,11 +641,13 @@ async def get_project(project_id: int, user=Depends(get_current_user)):
 @app.put("/projects/{project_id}")
 @limiter.limit("10/minute")
 async def update_project(request: Request, project_id: int, body: UpdateProjectRequest, user=Depends(get_current_user)):
-    """Iterate on an existing project with a new prompt"""
+    """Update project — metadata, design, context, or AI generation (if prompt given)"""
+    import json as _json
     with get_db() as conn:
         cur = conn.cursor()
         cur.execute(
-            "SELECT html_code, version FROM projects WHERE id = %s AND user_id = %s",
+            "SELECT html_code, version, design_preferences, context_md "
+            "FROM projects WHERE id = %s AND user_id = %s",
             (project_id, user["user_id"]),
         )
         row = cur.fetchone()
@@ -620,20 +655,80 @@ async def update_project(request: Request, project_id: int, body: UpdateProjectR
     if not row:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    result = generate_with_ai(body.prompt, row["html_code"], None)
+    updates = {"updated_at": datetime.now().isoformat()}
+    new_version = row["version"]
+    new_html = row["html_code"]
+
+    # Metadata updates
+    if body.name is not None:
+        updates["name"] = body.name
+        updates["slug"] = slugify(body.name)
+    if body.description is not None:
+        updates["description"] = body.description
+    if body.design_preferences is not None:
+        updates["design_preferences"] = _json.dumps(body.design_preferences)
+    if body.context_md is not None:
+        updates["context_md"] = body.context_md
+    if body.html_code is not None:
+        updates["html_code"] = body.html_code
+
+    # AI generation if prompt provided
+    if body.prompt:
+        from prompts import build_full_context
+        # Load resources for context
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT name, description, resource_type, content FROM project_resources WHERE project_id = %s",
+                (project_id,),
+            )
+            resources = cur.fetchall()
+
+        design_prefs = body.design_preferences or (row["design_preferences"] if isinstance(row["design_preferences"], dict) else {})
+        context_md = body.context_md if body.context_md is not None else (row["context_md"] or "")
+
+        system_prompt, user_message = build_full_context(
+            prompt=body.prompt,
+            existing_code=row["html_code"],
+            design_prefs=design_prefs,
+            context_md=context_md,
+            resources=resources,
+        )
+        result = generate_with_ai_full(system_prompt, user_message)
+        new_html = result["html"]
+        new_version = row["version"] + 1
+        updates["html_code"] = new_html
+        updates["version"] = new_version
+
+        # Auto-append to context_md
+        summary = body.prompt[:100].strip()
+        ctx = context_md or ""
+        ctx += f"\nv{new_version}: {summary}"
+        updates["context_md"] = ctx.strip()
+
+    # Build SET clause
+    set_parts = []
+    values = []
+    for k, v in updates.items():
+        if k == "design_preferences":
+            set_parts.append(f"{k} = %s::jsonb")
+        else:
+            set_parts.append(f"{k} = %s")
+        values.append(v)
+    values.extend([project_id, user["user_id"]])
 
     with get_db() as conn:
         cur = conn.cursor()
         cur.execute(
-            "UPDATE projects SET html_code = %s, version = %s, updated_at = %s WHERE id = %s AND user_id = %s",
-            (result["html"], row["version"] + 1, datetime.now().isoformat(), project_id, user["user_id"]),
+            f"UPDATE projects SET {', '.join(set_parts)} WHERE id = %s AND user_id = %s",
+            values,
         )
         conn.commit()
 
     return {
         "id": project_id,
-        "version": row["version"] + 1,
-        "html": result["html"],
+        "version": new_version,
+        "html": new_html,
     }
 
 
@@ -653,6 +748,151 @@ async def delete_project(project_id: int, user=Depends(get_current_user)):
         conn.commit()
 
     return {"message": "Project deleted"}
+
+
+# ==================== RESOURCE ROUTES ====================
+
+def _verify_project_owner(project_id: int, user_id: int):
+    """Check project exists and belongs to user. Returns project row or raises 404."""
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM projects WHERE id = %s AND user_id = %s", (project_id, user_id))
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return row
+
+
+@app.get("/projects/{project_id}/resources")
+async def list_resources(project_id: int, user=Depends(get_current_user)):
+    """List all resources for a project"""
+    _verify_project_owner(project_id, user["user_id"])
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, resource_type, name, description, content, mime_type, file_size, created_at "
+            "FROM project_resources WHERE project_id = %s ORDER BY created_at DESC",
+            (project_id,),
+        )
+        rows = cur.fetchall()
+    return {"resources": rows}
+
+
+@app.post("/projects/{project_id}/resources")
+@limiter.limit("20/minute")
+async def add_resource(request: Request, project_id: int, user=Depends(get_current_user)):
+    """Add a resource — supports JSON body or multipart file upload"""
+    _verify_project_owner(project_id, user["user_id"])
+
+    content_type = request.headers.get("content-type", "")
+
+    if "multipart/form-data" in content_type:
+        from fastapi import UploadFile
+        form = await request.form()
+        file = form.get("file")
+        name = form.get("name", getattr(file, "filename", "upload"))
+        description = form.get("description", "")
+        resource_type = form.get("resource_type", "image")
+
+        if not file or not hasattr(file, "read"):
+            raise HTTPException(status_code=400, detail="No file uploaded")
+
+        file_data = await file.read()
+        if len(file_data) > MAX_UPLOAD_SIZE:
+            raise HTTPException(status_code=400, detail="File too large (max 10 MB)")
+
+        # Save to DB first to get ID
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO project_resources (project_id, user_id, resource_type, name, description, mime_type, file_size) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                (project_id, user["user_id"], resource_type, name, description,
+                 getattr(file, "content_type", "application/octet-stream"), len(file_data)),
+            )
+            resource_id = cur.fetchone()["id"]
+
+            # Save file to disk
+            project_dir = os.path.join(UPLOADS_DIR, str(project_id))
+            os.makedirs(project_dir, exist_ok=True)
+            safe_name = f"{resource_id}_{name}"
+            filepath = os.path.join(project_dir, safe_name)
+            with open(filepath, "wb") as f:
+                f.write(file_data)
+
+            # Store filename in content column
+            cur.execute(
+                "UPDATE project_resources SET content = %s WHERE id = %s",
+                (safe_name, resource_id),
+            )
+            conn.commit()
+
+        return {
+            "id": resource_id,
+            "resource_type": resource_type,
+            "name": name,
+            "description": description,
+            "url": f"/uploads/{project_id}/{safe_name}",
+        }
+    else:
+        # JSON body for text resources
+        body = await request.json()
+        resource_type = body.get("resource_type", "text")
+        name = body.get("name", "")
+        description = body.get("description", "")
+        content = body.get("content", "")
+
+        if not name:
+            raise HTTPException(status_code=400, detail="Name is required")
+
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO project_resources (project_id, user_id, resource_type, name, description, content) "
+                "VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
+                (project_id, user["user_id"], resource_type, name, description, content),
+            )
+            resource_id = cur.fetchone()["id"]
+            conn.commit()
+
+        return {"id": resource_id, "resource_type": resource_type, "name": name, "description": description}
+
+
+@app.delete("/projects/{project_id}/resources/{resource_id}")
+async def delete_resource(project_id: int, resource_id: int, user=Depends(get_current_user)):
+    """Delete a resource"""
+    _verify_project_owner(project_id, user["user_id"])
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT content, resource_type FROM project_resources WHERE id = %s AND project_id = %s",
+            (resource_id, project_id),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Resource not found")
+
+        # Delete file from disk if it's a file resource
+        if row["resource_type"] in ("image", "logo") and row["content"]:
+            filepath = os.path.join(UPLOADS_DIR, str(project_id), row["content"])
+            if os.path.exists(filepath):
+                os.remove(filepath)
+
+        cur.execute("DELETE FROM project_resources WHERE id = %s", (resource_id,))
+        conn.commit()
+    return {"message": "Resource deleted"}
+
+
+# Serve uploaded files
+from fastapi.responses import FileResponse
+
+@app.get("/uploads/{project_id}/{filename}")
+async def serve_upload(project_id: int, filename: str):
+    """Serve uploaded resource files"""
+    filepath = os.path.join(UPLOADS_DIR, str(project_id), filename)
+    if not os.path.exists(filepath):
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(filepath)
 
 
 # ==================== WAITLIST ROUTES ====================
