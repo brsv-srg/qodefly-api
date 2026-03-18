@@ -291,6 +291,7 @@ class GenerateRequest(BaseModel):
     prompt: str
     project_id: int | None = None  # if iterating on existing project
     design_preferences: str | None = None
+    existing_code: str | None = None  # current HTML for iteration without saved project
 
     @field_validator("prompt")
     @classmethod
@@ -526,10 +527,10 @@ def slugify(text: str) -> str:
 @limiter.limit("10/minute")
 async def generate_project(request: Request, body: GenerateRequest, user=Depends(get_current_user)):
     """Generate HTML from a prompt using AI"""
-    existing_code = None
+    existing_code = body.existing_code or None
 
-    # If iterating on existing project, load current code
-    if body.project_id:
+    # If iterating on existing project, load current code from DB
+    if not existing_code and body.project_id:
         with get_db() as conn:
             cur = conn.cursor()
             cur.execute(
