@@ -7,7 +7,8 @@ import json
 from datetime import datetime, timedelta
 from contextlib import contextmanager
 
-import sqlite3
+import psycopg2
+import psycopg2.extras
 from fastapi import FastAPI, HTTPException, Request, Depends, Security
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader, HTTPBearer, HTTPAuthorizationCredentials
@@ -17,7 +18,7 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
 # --- Configuration ---
-DATABASE = "waitlist.db"
+DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://qodefly:qodefly@localhost:5432/qodefly")
 ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "change-me-in-production")
 JWT_SECRET = os.environ.get("JWT_SECRET", "change-me-jwt-secret-in-production")
 JWT_ALGORITHM = "HS256"
@@ -51,52 +52,121 @@ app.add_middleware(
 
 @contextmanager
 def get_db():
-    conn = sqlite3.connect(DATABASE)
-    conn.row_factory = sqlite3.Row
+    conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
     try:
         yield conn
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
 
+def _column_exists(cur, table: str, column: str) -> bool:
+    cur.execute(
+        "SELECT 1 FROM information_schema.columns WHERE table_name = %s AND column_name = %s",
+        (table, column),
+    )
+    return cur.fetchone() is not None
+
+
+def _add_column_if_missing(cur, table: str, column: str, definition: str):
+    if not _column_exists(cur, table, column):
+        cur.execute(f'ALTER TABLE {table} ADD COLUMN {column} {definition}')
+        print(f"  migration: added {table}.{column}")
+
+
 def init_db():
     with get_db() as conn:
-        conn.execute("""
+        cur = conn.cursor()
+
+        # --- Create tables ---
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS waitlist (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 email TEXT UNIQUE NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                created_at TIMESTAMP DEFAULT NOW(),
                 ip_address TEXT,
                 user_agent TEXT
             )
         """)
-        conn.execute("""
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 email TEXT UNIQUE NOT NULL,
                 password_hash TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                created_at TIMESTAMP DEFAULT NOW(),
                 last_login TIMESTAMP,
-                is_active INTEGER DEFAULT 1,
-                is_beta INTEGER DEFAULT 1
+                is_active BOOLEAN DEFAULT TRUE,
+                is_beta BOOLEAN DEFAULT TRUE
             )
         """)
-        conn.execute("""
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS projects (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id),
                 name TEXT NOT NULL,
                 slug TEXT NOT NULL,
                 description TEXT,
                 html_code TEXT,
                 status TEXT DEFAULT 'draft',
                 version INTEGER DEFAULT 1,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (user_id) REFERENCES users(id)
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
             )
         """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS schema_version (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                version INTEGER NOT NULL DEFAULT 0,
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+
+        cur.execute("SELECT version FROM schema_version WHERE id = 1")
+        row = cur.fetchone()
+        if not row:
+            cur.execute("INSERT INTO schema_version (id, version) VALUES (1, 0)")
+            current_version = 0
+        else:
+            current_version = row["version"]
+
+        # --- Migrations ---
+        migrations_applied = 0
+
+        # Migration 1: baseline — ensure all columns exist
+        if current_version < 1:
+            for table, columns in {
+                "users": [
+                    ("last_login", "TIMESTAMP"),
+                    ("is_active", "BOOLEAN DEFAULT TRUE"),
+                    ("is_beta", "BOOLEAN DEFAULT TRUE"),
+                ],
+                "projects": [
+                    ("description", "TEXT"),
+                    ("html_code", "TEXT"),
+                    ("status", "TEXT DEFAULT 'draft'"),
+                    ("version", "INTEGER DEFAULT 1"),
+                    ("updated_at", "TIMESTAMP DEFAULT NOW()"),
+                ],
+            }.items():
+                for col_name, col_def in columns:
+                    _add_column_if_missing(cur, table, col_name, col_def)
+            current_version = 1
+            migrations_applied += 1
+
+        # --- Future migrations go here ---
+        # if current_version < 2:
+        #     _add_column_if_missing(cur, "projects", "deployed_url", "TEXT")
+        #     current_version = 2
+        #     migrations_applied += 1
+
+        cur.execute(
+            "UPDATE schema_version SET version = %s, updated_at = %s WHERE id = 1",
+            (current_version, datetime.now().isoformat()),
+        )
         conn.commit()
+        print(f"DB ready: version={current_version}, migrations_applied={migrations_applied}")
 
 
 @app.on_event("startup")
@@ -276,20 +346,20 @@ async def register(request: Request, body: RegisterRequest):
     try:
         password_hash = hash_password(body.password)
         with get_db() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "INSERT INTO users (email, password_hash) VALUES (?, ?)",
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO users (email, password_hash) VALUES (%s, %s) RETURNING id",
                 (body.email, password_hash),
             )
+            user_id = cur.fetchone()["id"]
             conn.commit()
-            user_id = cursor.lastrowid
 
         token = create_jwt(user_id, body.email)
         return AuthResponse(
             access_token=token,
             user={"id": user_id, "email": body.email, "is_beta": True},
         )
-    except sqlite3.IntegrityError:
+    except psycopg2.IntegrityError:
         raise HTTPException(status_code=400, detail="An account with this email already exists")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Registration failed: {str(e)}")
@@ -300,10 +370,12 @@ async def register(request: Request, body: RegisterRequest):
 async def login(request: Request, body: LoginRequest):
     """Log in and receive a JWT token"""
     with get_db() as conn:
-        row = conn.execute(
-            "SELECT id, email, password_hash, is_active, is_beta FROM users WHERE email = ?",
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, email, password_hash, is_active, is_beta FROM users WHERE email = %s",
             (body.email,),
-        ).fetchone()
+        )
+        row = cur.fetchone()
 
     if not row:
         raise HTTPException(status_code=401, detail="Invalid email or password")
@@ -313,8 +385,9 @@ async def login(request: Request, body: LoginRequest):
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
     with get_db() as conn:
-        conn.execute(
-            "UPDATE users SET last_login = ? WHERE id = ?",
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE users SET last_login = %s WHERE id = %s",
             (datetime.now().isoformat(), row["id"]),
         )
         conn.commit()
@@ -330,10 +403,12 @@ async def login(request: Request, body: LoginRequest):
 async def get_me(user=Depends(get_current_user)):
     """Get current authenticated user"""
     with get_db() as conn:
-        row = conn.execute(
-            "SELECT id, email, created_at, is_beta FROM users WHERE id = ?",
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, email, created_at, is_beta FROM users WHERE id = %s",
             (user["user_id"],),
-        ).fetchone()
+        )
+        row = cur.fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="User not found")
     return {
@@ -456,10 +531,12 @@ async def generate_project(request: Request, body: GenerateRequest, user=Depends
     # If iterating on existing project, load current code
     if body.project_id:
         with get_db() as conn:
-            row = conn.execute(
-                "SELECT html_code FROM projects WHERE id = ? AND user_id = ?",
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT html_code FROM projects WHERE id = %s AND user_id = %s",
                 (body.project_id, user["user_id"]),
-            ).fetchone()
+            )
+            row = cur.fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="Project not found")
             existing_code = row["html_code"]
@@ -475,13 +552,13 @@ async def create_project(request: Request, body: SaveProjectRequest, user=Depend
     slug = slugify(body.name)
 
     with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO projects (user_id, name, slug, description, html_code) VALUES (?, ?, ?, ?, ?)",
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO projects (user_id, name, slug, description, html_code) VALUES (%s, %s, %s, %s, %s) RETURNING id",
             (user["user_id"], body.name, slug, body.description, body.html_code),
         )
+        project_id = cur.fetchone()["id"]
         conn.commit()
-        project_id = cursor.lastrowid
 
     return {
         "id": project_id,
@@ -496,15 +573,17 @@ async def create_project(request: Request, body: SaveProjectRequest, user=Depend
 async def list_projects(user=Depends(get_current_user)):
     """List all projects for the current user"""
     with get_db() as conn:
-        rows = conn.execute(
+        cur = conn.cursor()
+        cur.execute(
             "SELECT id, name, slug, description, status, version, created_at, updated_at "
-            "FROM projects WHERE user_id = ? ORDER BY updated_at DESC",
+            "FROM projects WHERE user_id = %s ORDER BY updated_at DESC",
             (user["user_id"],),
-        ).fetchall()
+        )
+        rows = cur.fetchall()
 
     return {
         "total": len(rows),
-        "projects": [dict(row) for row in rows],
+        "projects": rows,
     }
 
 
@@ -512,15 +591,17 @@ async def list_projects(user=Depends(get_current_user)):
 async def get_project(project_id: int, user=Depends(get_current_user)):
     """Get a single project with its code"""
     with get_db() as conn:
-        row = conn.execute(
+        cur = conn.cursor()
+        cur.execute(
             "SELECT id, name, slug, description, html_code, status, version, created_at, updated_at "
-            "FROM projects WHERE id = ? AND user_id = ?",
+            "FROM projects WHERE id = %s AND user_id = %s",
             (project_id, user["user_id"]),
-        ).fetchone()
+        )
+        row = cur.fetchone()
 
     if not row:
         raise HTTPException(status_code=404, detail="Project not found")
-    return dict(row)
+    return row
 
 
 @app.put("/projects/{project_id}")
@@ -528,10 +609,12 @@ async def get_project(project_id: int, user=Depends(get_current_user)):
 async def update_project(request: Request, project_id: int, body: UpdateProjectRequest, user=Depends(get_current_user)):
     """Iterate on an existing project with a new prompt"""
     with get_db() as conn:
-        row = conn.execute(
-            "SELECT html_code, version FROM projects WHERE id = ? AND user_id = ?",
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT html_code, version FROM projects WHERE id = %s AND user_id = %s",
             (project_id, user["user_id"]),
-        ).fetchone()
+        )
+        row = cur.fetchone()
 
     if not row:
         raise HTTPException(status_code=404, detail="Project not found")
@@ -539,8 +622,9 @@ async def update_project(request: Request, project_id: int, body: UpdateProjectR
     result = generate_with_ai(body.prompt, row["html_code"], None)
 
     with get_db() as conn:
-        conn.execute(
-            "UPDATE projects SET html_code = ?, version = ?, updated_at = ? WHERE id = ? AND user_id = ?",
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE projects SET html_code = %s, version = %s, updated_at = %s WHERE id = %s AND user_id = %s",
             (result["html"], row["version"] + 1, datetime.now().isoformat(), project_id, user["user_id"]),
         )
         conn.commit()
@@ -556,13 +640,15 @@ async def update_project(request: Request, project_id: int, body: UpdateProjectR
 async def delete_project(project_id: int, user=Depends(get_current_user)):
     """Delete a project"""
     with get_db() as conn:
-        row = conn.execute(
-            "SELECT id FROM projects WHERE id = ? AND user_id = ?",
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id FROM projects WHERE id = %s AND user_id = %s",
             (project_id, user["user_id"]),
-        ).fetchone()
+        )
+        row = cur.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Project not found")
-        conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+        cur.execute("DELETE FROM projects WHERE id = %s", (project_id,))
         conn.commit()
 
     return {"message": "Project deleted"}
@@ -578,13 +664,14 @@ async def add_to_waitlist(request: Request, submission: EmailSubmission):
         client_ip = request.client.host if request.client else None
         user_agent = request.headers.get("user-agent")
         with get_db() as conn:
-            conn.execute(
-                "INSERT INTO waitlist (email, ip_address, user_agent) VALUES (?, ?, ?)",
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO waitlist (email, ip_address, user_agent) VALUES (%s, %s, %s)",
                 (submission.email, client_ip, user_agent),
             )
             conn.commit()
         return EmailResponse(message="Successfully added to waitlist!", email=submission.email)
-    except sqlite3.IntegrityError:
+    except psycopg2.IntegrityError:
         raise HTTPException(status_code=400, detail="This email is already on the waitlist")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to add email: {str(e)}")
@@ -594,7 +681,9 @@ async def add_to_waitlist(request: Request, submission: EmailSubmission):
 @limiter.limit("30/minute")
 async def get_waitlist_count(request: Request):
     with get_db() as conn:
-        result = conn.execute("SELECT COUNT(*) as count FROM waitlist").fetchone()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) as count FROM waitlist")
+        result = cur.fetchone()
         return {"count": result["count"]}
 
 
@@ -603,12 +692,12 @@ async def get_waitlist_count(request: Request):
 @app.get("/admin/waitlist")
 async def get_all_emails(api_key: str = Depends(verify_admin_key)):
     with get_db() as conn:
-        rows = conn.execute(
-            "SELECT id, email, created_at, ip_address, user_agent FROM waitlist ORDER BY created_at DESC"
-        ).fetchall()
+        cur = conn.cursor()
+        cur.execute("SELECT id, email, created_at, ip_address, user_agent FROM waitlist ORDER BY created_at DESC")
+        rows = cur.fetchall()
         return {
             "total": len(rows),
-            "emails": [dict(row) for row in rows],
+            "emails": rows,
         }
 
 
@@ -616,40 +705,44 @@ async def get_all_emails(api_key: str = Depends(verify_admin_key)):
 async def get_all_users(api_key: str = Depends(verify_admin_key)):
     """Get all registered users"""
     with get_db() as conn:
-        rows = conn.execute(
-            "SELECT id, email, created_at, last_login, is_active, is_beta FROM users ORDER BY created_at DESC"
-        ).fetchall()
+        cur = conn.cursor()
+        cur.execute("SELECT id, email, created_at, last_login, is_active, is_beta FROM users ORDER BY created_at DESC")
+        rows = cur.fetchall()
         return {
             "total": len(rows),
-            "users": [
-                {**dict(row), "is_active": bool(row["is_active"]), "is_beta": bool(row["is_beta"])}
-                for row in rows
-            ],
+            "users": rows,
         }
 
 
 @app.get("/admin/stats")
 async def get_stats(api_key: str = Depends(verify_admin_key)):
     with get_db() as conn:
+        cur = conn.cursor()
         today = datetime.now().strftime("%Y-%m-%d")
 
-        wl_total = conn.execute("SELECT COUNT(*) as c FROM waitlist").fetchone()["c"]
-        wl_today = conn.execute("SELECT COUNT(*) as c FROM waitlist WHERE DATE(created_at) = ?", (today,)).fetchone()["c"]
-        u_total = conn.execute("SELECT COUNT(*) as c FROM users").fetchone()["c"]
-        u_today = conn.execute("SELECT COUNT(*) as c FROM users WHERE DATE(created_at) = ?", (today,)).fetchone()["c"]
+        cur.execute("SELECT COUNT(*) as c FROM waitlist")
+        wl_total = cur.fetchone()["c"]
+        cur.execute("SELECT COUNT(*) as c FROM waitlist WHERE DATE(created_at) = %s", (today,))
+        wl_today = cur.fetchone()["c"]
+        cur.execute("SELECT COUNT(*) as c FROM users")
+        u_total = cur.fetchone()["c"]
+        cur.execute("SELECT COUNT(*) as c FROM users WHERE DATE(created_at) = %s", (today,))
+        u_today = cur.fetchone()["c"]
 
-        wl_7d = conn.execute(
+        cur.execute(
             "SELECT DATE(created_at) as day, COUNT(*) as count FROM waitlist "
-            "WHERE created_at >= datetime('now', '-7 days') GROUP BY DATE(created_at) ORDER BY day DESC"
-        ).fetchall()
-        u_7d = conn.execute(
+            "WHERE created_at >= NOW() - INTERVAL '7 days' GROUP BY DATE(created_at) ORDER BY day DESC"
+        )
+        wl_7d = cur.fetchall()
+        cur.execute(
             "SELECT DATE(created_at) as day, COUNT(*) as count FROM users "
-            "WHERE created_at >= datetime('now', '-7 days') GROUP BY DATE(created_at) ORDER BY day DESC"
-        ).fetchall()
+            "WHERE created_at >= NOW() - INTERVAL '7 days' GROUP BY DATE(created_at) ORDER BY day DESC"
+        )
+        u_7d = cur.fetchall()
 
         return {
-            "waitlist": {"total": wl_total, "today": wl_today, "last_7_days": [dict(r) for r in wl_7d]},
-            "users": {"total": u_total, "today": u_today, "last_7_days": [dict(r) for r in u_7d]},
+            "waitlist": {"total": wl_total, "today": wl_today, "last_7_days": wl_7d},
+            "users": {"total": u_total, "today": u_today, "last_7_days": u_7d},
         }
 
 
@@ -659,7 +752,9 @@ async def export_waitlist_csv(api_key: str = Depends(verify_admin_key)):
     import io, csv
 
     with get_db() as conn:
-        rows = conn.execute("SELECT id, email, created_at, ip_address, user_agent FROM waitlist ORDER BY created_at DESC").fetchall()
+        cur = conn.cursor()
+        cur.execute("SELECT id, email, created_at, ip_address, user_agent FROM waitlist ORDER BY created_at DESC")
+        rows = cur.fetchall()
 
     output = io.StringIO()
     writer = csv.writer(output)
