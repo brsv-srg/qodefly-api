@@ -179,6 +179,35 @@ def init_db():
             current_version = 2
             migrations_applied += 1
 
+        # Migration 3: chat messages, content blocks, decisions, resource sections
+        if current_version < 3:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS chat_messages (
+                    id SERIAL PRIMARY KEY,
+                    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    actions JSONB,
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_chat_messages_project ON chat_messages(project_id, created_at)")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS content_blocks (
+                    id SERIAL PRIMARY KEY,
+                    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    section TEXT NOT NULL,
+                    field TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    sort_order INTEGER DEFAULT 0,
+                    UNIQUE(project_id, section, field)
+                )
+            """)
+            _add_column_if_missing(cur, "project_resources", "section", "TEXT")
+            _add_column_if_missing(cur, "projects", "decisions", "JSONB DEFAULT '{}'")
+            current_version = 3
+            migrations_applied += 1
+
         # --- Future migrations go here ---
 
         cur.execute(
@@ -456,12 +485,22 @@ async def get_me(user=Depends(get_current_user)):
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 
-def _call_claude(system_prompt: str, user_message: str) -> str | None:
-    """Call Claude API and return raw text response, or None on failure."""
+def _call_claude(system_prompt: str, user_message: str = None, messages: list = None) -> str | None:
+    """Call Claude API and return raw text response, or None on failure.
+
+    Either pass user_message (single turn) or messages (multi-turn list of {role, content} dicts).
+    """
     if not ANTHROPIC_API_KEY:
         return None
     try:
         import httpx
+        if messages:
+            msgs = messages
+        elif user_message:
+            msgs = [{"role": "user", "content": user_message}]
+        else:
+            return None
+
         response = httpx.post(
             "https://api.anthropic.com/v1/messages",
             headers={
@@ -473,18 +512,18 @@ def _call_claude(system_prompt: str, user_message: str) -> str | None:
                 "model": "claude-sonnet-4-20250514",
                 "max_tokens": 16000,
                 "system": system_prompt,
-                "messages": [{"role": "user", "content": user_message}],
+                "messages": msgs,
             },
             timeout=120.0,
         )
         response.raise_for_status()
         data = response.json()
-        html = data["content"][0]["text"]
-        if html.startswith("```"):
-            html = html.split("\n", 1)[1]
-        if html.endswith("```"):
-            html = html.rsplit("```", 1)[0]
-        return html.strip()
+        text = data["content"][0]["text"]
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1]
+        if text.endswith("```"):
+            text = text.rsplit("```", 1)[0]
+        return text.strip()
     except Exception as e:
         print(f"Claude API error: {e}")
         return None
@@ -893,6 +932,393 @@ async def serve_upload(project_id: int, filename: str):
     if not os.path.exists(filepath):
         raise HTTPException(status_code=404, detail="File not found")
     return FileResponse(filepath)
+
+
+# ==================== CHAT MESSAGES ====================
+
+@app.get("/projects/{project_id}/messages")
+async def list_messages(project_id: int, user=Depends(get_current_user)):
+    """Get all chat messages for a project"""
+    _verify_project_owner(project_id, user["user_id"])
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, role, content, actions, created_at FROM chat_messages WHERE project_id = %s ORDER BY created_at ASC",
+            (project_id,),
+        )
+        rows = cur.fetchall()
+    return {"messages": rows}
+
+
+class SendMessageRequest(BaseModel):
+    content: str
+
+
+def _parse_actions(text: str):
+    """Extract <actions>JSON</actions> from Claude response. Returns (display_text, actions_dict)."""
+    if "<actions>" not in text:
+        return text.strip(), None
+    parts = text.split("<actions>", 1)
+    display = parts[0].strip()
+    remainder = parts[1]
+    if "</actions>" in remainder:
+        json_str = remainder.split("</actions>", 1)[0].strip()
+        try:
+            import json as _json
+            actions = _json.loads(json_str)
+            return display, actions
+        except Exception:
+            return text.strip(), None
+    return text.strip(), None
+
+
+def _apply_actions(project_id: int, actions: dict, cur):
+    """Apply parsed actions to database. Returns set of what changed."""
+    import json as _json
+    changed = set()
+
+    if "update_properties" in actions:
+        props = actions["update_properties"]
+        if "name" in props:
+            slug = slugify(props["name"])
+            cur.execute("UPDATE projects SET name = %s, slug = %s WHERE id = %s", (props["name"], slug, project_id))
+            changed.add("properties")
+        if "description" in props:
+            cur.execute("UPDATE projects SET description = %s WHERE id = %s", (props["description"], project_id))
+            changed.add("properties")
+
+    if "update_design" in actions:
+        design = actions["update_design"]
+        cur.execute("SELECT design_preferences FROM projects WHERE id = %s", (project_id,))
+        row = cur.fetchone()
+        current = row["design_preferences"] if row and isinstance(row["design_preferences"], dict) else {}
+        current.update(design)
+        cur.execute("UPDATE projects SET design_preferences = %s::jsonb WHERE id = %s", (_json.dumps(current), project_id))
+        changed.add("design")
+
+    if "update_content" in actions:
+        for block in actions["update_content"]:
+            section = block.get("section", "")
+            field = block.get("field", "")
+            content = block.get("content", "")
+            order = block.get("sort_order", 0)
+            if section and field and content:
+                cur.execute("""
+                    INSERT INTO content_blocks (project_id, section, field, content, sort_order)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (project_id, section, field) DO UPDATE SET content = EXCLUDED.content, sort_order = EXCLUDED.sort_order
+                """, (project_id, section, field, content, order))
+                changed.add("content")
+
+    if "update_decisions" in actions:
+        decisions = actions["update_decisions"]
+        cur.execute("SELECT decisions FROM projects WHERE id = %s", (project_id,))
+        row = cur.fetchone()
+        current = row["decisions"] if row and isinstance(row["decisions"], dict) else {}
+        current.update(decisions)
+        cur.execute("UPDATE projects SET decisions = %s::jsonb WHERE id = %s", (_json.dumps(current), project_id))
+        changed.add("decisions")
+
+    return changed
+
+
+def _build_project_state_summary(project_id: int, cur) -> str:
+    """Build a compact summary of project state for the chat system prompt."""
+    cur.execute(
+        "SELECT name, description, design_preferences, context_md, decisions, html_code, version "
+        "FROM projects WHERE id = %s",
+        (project_id,),
+    )
+    p = cur.fetchone()
+    if not p:
+        return ""
+
+    lines = []
+    lines.append(f"Name: {p['name']}")
+    lines.append(f"Description: {p['description'] or '(not set)'}")
+    lines.append(f"Version: {p['version']}")
+    lines.append(f"Has HTML: {'yes' if p['html_code'] else 'no'}")
+
+    # Design
+    dp = p["design_preferences"] if isinstance(p["design_preferences"], dict) else {}
+    if dp:
+        parts = []
+        if dp.get("palette_preset"):
+            parts.append(f"palette={dp['palette_preset']}")
+        if dp.get("font_pair"):
+            parts.append(f"fonts={dp['font_pair']}")
+        if dp.get("style_tags"):
+            parts.append(f"style={','.join(dp['style_tags'])}")
+        if dp.get("spacing"):
+            parts.append(f"spacing={dp['spacing']}")
+        lines.append(f"Design: {', '.join(parts) if parts else '(not set)'}")
+    else:
+        lines.append("Design: (not set)")
+
+    # Content blocks
+    cur.execute("SELECT DISTINCT section FROM content_blocks WHERE project_id = %s", (project_id,))
+    sections = [r["section"] for r in cur.fetchall()]
+    lines.append(f"Content sections filled: {', '.join(sections) if sections else '(none)'}")
+
+    # Resources
+    cur.execute("SELECT name, resource_type, section FROM project_resources WHERE project_id = %s", (project_id,))
+    resources = cur.fetchall()
+    if resources:
+        res_parts = [f"{r['name']} ({r['resource_type']}{', section=' + r['section'] if r.get('section') else ''})" for r in resources]
+        lines.append(f"Resources: {'; '.join(res_parts)}")
+    else:
+        lines.append("Resources: (none)")
+
+    # Decisions
+    decisions = p["decisions"] if isinstance(p["decisions"], dict) else {}
+    if decisions:
+        lines.append(f"Decisions: {', '.join(f'{k}={v}' for k, v in decisions.items())}")
+    else:
+        lines.append("Decisions: (not set)")
+
+    return "\n".join(lines)
+
+
+@app.post("/projects/{project_id}/messages")
+@limiter.limit("20/minute")
+async def send_message(request: Request, project_id: int, body: SendMessageRequest, user=Depends(get_current_user)):
+    """Send a chat message — triggers AI response with optional actions and HTML generation."""
+    _verify_project_owner(project_id, user["user_id"])
+
+    with get_db() as conn:
+        cur = conn.cursor()
+
+        # 1. Save user message
+        cur.execute(
+            "INSERT INTO chat_messages (project_id, role, content) VALUES (%s, 'user', %s) RETURNING id, created_at",
+            (project_id, body.content),
+        )
+        user_msg_row = cur.fetchone()
+
+        # 2. Load last 20 messages for context
+        cur.execute(
+            "SELECT role, content FROM chat_messages WHERE project_id = %s ORDER BY created_at DESC LIMIT 20",
+            (project_id,),
+        )
+        recent = list(reversed(cur.fetchall()))
+
+        # 3. Build project state summary
+        state_summary = _build_project_state_summary(project_id, cur)
+
+        # 4. Build chat prompt and call Claude
+        from prompts import build_chat_prompt
+        system_prompt = build_chat_prompt(state_summary)
+        messages_for_claude = [{"role": r["role"] if r["role"] != "system" else "user", "content": r["content"]} for r in recent]
+
+        chat_response = _call_claude(system_prompt, None, messages_for_claude)
+        if not chat_response:
+            chat_response = "I'm sorry, I had trouble responding. Please try again."
+
+        # 5. Parse actions from response
+        display_text, actions = _parse_actions(chat_response)
+
+        # 6. Apply actions if any
+        import json as _json
+        changed = set()
+        if actions:
+            changed = _apply_actions(project_id, actions, cur)
+
+        # 7. If data changed, trigger HTML generation
+        project_updates = {}
+        if changed:
+            cur.execute(
+                "SELECT html_code, version, design_preferences, context_md FROM projects WHERE id = %s",
+                (project_id,),
+            )
+            proj = cur.fetchone()
+
+            # Load resources and content for generation
+            cur.execute(
+                "SELECT name, description, resource_type, content, section FROM project_resources WHERE project_id = %s",
+                (project_id,),
+            )
+            resources = cur.fetchall()
+
+            cur.execute(
+                "SELECT section, field, content FROM content_blocks WHERE project_id = %s ORDER BY sort_order",
+                (project_id,),
+            )
+            content_blocks = cur.fetchall()
+
+            from prompts import build_full_context
+            design_prefs = proj["design_preferences"] if isinstance(proj["design_preferences"], dict) else {}
+            context_md = proj["context_md"] or ""
+
+            gen_system, gen_user = build_full_context(
+                prompt=body.content,
+                existing_code=proj["html_code"],
+                design_prefs=design_prefs,
+                context_md=context_md,
+                resources=resources,
+                content_blocks=content_blocks,
+            )
+            gen_result = _call_claude(gen_system, gen_user)
+            if gen_result:
+                new_version = proj["version"] + 1
+                summary = body.content[:100].strip()
+                new_context = (context_md or "") + f"\nv{new_version}: {summary}"
+                cur.execute(
+                    "UPDATE projects SET html_code = %s, version = %s, context_md = %s, updated_at = NOW() WHERE id = %s",
+                    (gen_result, new_version, new_context.strip(), project_id),
+                )
+                project_updates["html_code"] = gen_result
+                project_updates["version"] = new_version
+
+        # 8. Save assistant message
+        cur.execute(
+            "INSERT INTO chat_messages (project_id, role, content, actions) VALUES (%s, 'assistant', %s, %s) RETURNING id, created_at",
+            (project_id, display_text, _json.dumps(actions) if actions else None),
+        )
+        asst_row = cur.fetchone()
+
+        # Reload project for updates
+        cur.execute(
+            "SELECT design_preferences, decisions FROM projects WHERE id = %s",
+            (project_id,),
+        )
+        proj_state = cur.fetchone()
+        if actions:
+            project_updates["design_preferences"] = proj_state["design_preferences"]
+            project_updates["decisions"] = proj_state["decisions"]
+
+        conn.commit()
+
+    return {
+        "message": {
+            "id": asst_row["id"],
+            "role": "assistant",
+            "content": display_text,
+            "actions": actions,
+            "created_at": str(asst_row["created_at"]),
+        },
+        "project_updates": project_updates,
+    }
+
+
+# ==================== CONTENT BLOCKS ====================
+
+@app.get("/projects/{project_id}/content")
+async def list_content_blocks(project_id: int, user=Depends(get_current_user)):
+    """Get all content blocks for a project"""
+    _verify_project_owner(project_id, user["user_id"])
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, section, field, content, sort_order FROM content_blocks WHERE project_id = %s ORDER BY sort_order, section, field",
+            (project_id,),
+        )
+        rows = cur.fetchall()
+    return {"blocks": rows}
+
+
+class ContentBlockInput(BaseModel):
+    section: str
+    field: str
+    content: str
+    sort_order: int = 0
+
+
+class UpsertContentRequest(BaseModel):
+    blocks: list
+
+
+@app.put("/projects/{project_id}/content")
+@limiter.limit("20/minute")
+async def upsert_content_blocks(request: Request, project_id: int, body: UpsertContentRequest, user=Depends(get_current_user)):
+    """Upsert content blocks — triggers regeneration + chat sync"""
+    _verify_project_owner(project_id, user["user_id"])
+
+    with get_db() as conn:
+        cur = conn.cursor()
+        for block in body.blocks:
+            cur.execute("""
+                INSERT INTO content_blocks (project_id, section, field, content, sort_order)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (project_id, section, field) DO UPDATE SET content = EXCLUDED.content, sort_order = EXCLUDED.sort_order
+            """, (project_id, block.get("section"), block.get("field"), block.get("content"), block.get("sort_order", 0)))
+
+        # Insert system message for chat sync
+        sections = set(b.get("section", "") for b in body.blocks)
+        cur.execute(
+            "INSERT INTO chat_messages (project_id, role, content) VALUES (%s, 'system', %s)",
+            (project_id, f"[System: Content updated for sections: {', '.join(sections)}]"),
+        )
+        conn.commit()
+
+    return {"status": "ok"}
+
+
+@app.delete("/projects/{project_id}/content/{block_id}")
+async def delete_content_block(project_id: int, block_id: int, user=Depends(get_current_user)):
+    """Delete a content block"""
+    _verify_project_owner(project_id, user["user_id"])
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM content_blocks WHERE id = %s AND project_id = %s", (block_id, project_id))
+        conn.commit()
+    return {"message": "Block deleted"}
+
+
+# ==================== DECISIONS ====================
+
+@app.put("/projects/{project_id}/decisions")
+@limiter.limit("10/minute")
+async def update_decisions(request: Request, project_id: int, user=Depends(get_current_user)):
+    """Update project decisions"""
+    _verify_project_owner(project_id, user["user_id"])
+    import json as _json
+    data = await request.json()
+    decisions = data.get("decisions", {})
+
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE projects SET decisions = %s::jsonb WHERE id = %s",
+            (_json.dumps(decisions), project_id),
+        )
+        # Chat sync
+        cur.execute(
+            "INSERT INTO chat_messages (project_id, role, content) VALUES (%s, 'system', %s)",
+            (project_id, "[System: Project decisions updated]"),
+        )
+        conn.commit()
+
+    return {"status": "ok"}
+
+
+# ==================== RESOURCE UPDATE ====================
+
+@app.patch("/projects/{project_id}/resources/{resource_id}")
+async def patch_resource(request: Request, project_id: int, resource_id: int, user=Depends(get_current_user)):
+    """Update resource section and/or description"""
+    _verify_project_owner(project_id, user["user_id"])
+    data = await request.json()
+
+    with get_db() as conn:
+        cur = conn.cursor()
+        updates = []
+        values = []
+        if "section" in data:
+            updates.append("section = %s")
+            values.append(data["section"])
+        if "description" in data:
+            updates.append("description = %s")
+            values.append(data["description"])
+        if not updates:
+            return {"message": "Nothing to update"}
+        values.extend([resource_id, project_id])
+        cur.execute(
+            f"UPDATE project_resources SET {', '.join(updates)} WHERE id = %s AND project_id = %s",
+            values,
+        )
+        conn.commit()
+
+    return {"status": "ok"}
 
 
 # ==================== WAITLIST ROUTES ====================

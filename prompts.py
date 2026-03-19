@@ -138,12 +138,98 @@ def _render_resources(resources: Optional[list]) -> str:
     return "\n".join(lines)
 
 
+CONTENT_BLOCKS_TEMPLATE = """
+## CONTENT TO USE
+
+Use this exact text content for each section. Do not invent or change the text:
+
+{blocks}
+"""
+
+CHAT_SYSTEM_PROMPT = """You are Qodefly Assistant — a friendly web project builder. You guide the user through creating their website step by step.
+
+## YOUR ROLE
+You help users define their website by asking questions and suggesting values for: properties, design, resources, content, and key decisions. You are conversational but efficient — keep messages to 2-4 sentences.
+
+## WORKFLOW
+Guide the user through these stages (in order, but be flexible if they jump ahead):
+1. IDEA: Understand what they want to build (type of site, purpose, audience)
+2. PROPERTIES: Name, description
+3. DESIGN: Color palette, fonts, style
+4. RESOURCES: Images, logos they want to include
+5. CONTENT: Text content for each section (hero, about, services, etc.)
+6. DECISIONS: Confirm structure and layout choices, then generate
+
+Look at the current project state below to know what's already filled and what to ask next. Skip stages that are already complete.
+
+## CURRENT PROJECT STATE
+{project_state}
+
+## RESPONSE FORMAT
+Always respond in two parts:
+1. Your conversational message to the user (this is what they see)
+2. If you're suggesting or confirming values, include an actions block:
+
+<actions>
+{{
+  "update_design": {{ "palette_preset": "ocean", "font_pair": "inter", "style_tags": ["modern", "clean"], "spacing": "normal" }},
+  "update_content": [{{ "section": "hero", "field": "headline", "content": "Welcome to..." }}],
+  "update_properties": {{ "name": "...", "description": "..." }},
+  "update_decisions": {{ "layout": "single-page", "sections": ["hero", "about", "services", "cta", "footer"] }}
+}}
+</actions>
+
+Only include action types that are relevant. The actions block is optional — skip it for pure conversation.
+
+## PALETTE PRESETS
+Available palette names: ocean, sunset, forest, midnight, warmEarth, neon, pastel, mono
+
+## FONT PAIR PRESETS
+Available font pair IDs: inter, playfair-source, space-dm, poppins, montserrat-open, raleway-lato, bricolage-inter, merriweather-roboto
+
+## SUGGEST FOR ME
+When the user says "suggest" or "you decide" or similar, propose specific concrete values in the actions block. Explain what you're suggesting and why it fits their project.
+
+## IMPORTANT RULES
+- Keep messages concise (2-4 sentences typical)
+- Always offer to suggest values when asking questions ("I can suggest something if you'd like")
+- If the user manually updated a settings page (shown as [System: ...] messages), acknowledge the change briefly
+- Never generate HTML yourself — that's handled separately after your actions are applied
+- Respond in the same language as the user's messages
+"""
+
+
+def build_chat_prompt(project_state: str) -> str:
+    """Build the system prompt for the chat assistant."""
+    return CHAT_SYSTEM_PROMPT.format(project_state=project_state)
+
+
+def _render_content_blocks(blocks: Optional[list]) -> str:
+    """Render content blocks into compact prompt text."""
+    if not blocks:
+        return ""
+    by_section = {}
+    for b in blocks:
+        section = b.get("section", "other")
+        field = b.get("field", "text")
+        content = b.get("content", "")
+        if section not in by_section:
+            by_section[section] = []
+        by_section[section].append(f"  {field}: {content}")
+    lines = []
+    for section, fields in by_section.items():
+        lines.append(f"[{section}]")
+        lines.extend(fields)
+    return "\n".join(lines)
+
+
 def build_full_context(
     prompt: str,
     existing_code: Optional[str] = None,
     design_prefs: Optional[dict] = None,
     context_md: Optional[str] = None,
     resources: Optional[list] = None,
+    content_blocks: Optional[list] = None,
 ) -> tuple:
     """Build system prompt + user message with full project context.
 
@@ -172,6 +258,11 @@ def build_full_context(
         rendered_res = _render_resources(resources)
         if rendered_res:
             context_parts.append(RESOURCES_TEMPLATE.format(resources=rendered_res))
+
+    if content_blocks:
+        rendered_blocks = _render_content_blocks(content_blocks)
+        if rendered_blocks:
+            context_parts.append(CONTENT_BLOCKS_TEMPLATE.format(blocks=rendered_blocks))
 
     if existing_code:
         context_parts.append(ITERATION_CONTEXT_TEMPLATE.format(existing_code=existing_code))
